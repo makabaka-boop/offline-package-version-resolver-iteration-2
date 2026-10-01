@@ -1,14 +1,18 @@
 import itertools
 import random
+from dataclasses import replace
 
 import pytest
 
-from resolver import parse_request, solve
+from resolver import PackageChange, parse_request, solve, solve_relaxed_roots
 
 
 def brute_force(payload: dict):
     """Enumerate every (installed-or-absent) version combination."""
-    catalog = parse_request(payload)
+    return brute_force_catalog(parse_request(payload))
+
+
+def brute_force_catalog(catalog):
     best = None
     best_key = None
 
@@ -69,10 +73,52 @@ def is_complete_solution(catalog, candidate):
     return True
 
 
+def brute_force_relaxed(payload: dict):
+    """Enumerate retained root subsets, then enumerate their complete closures."""
+    catalog = parse_request(payload)
+    if brute_force_catalog(catalog) is not None:
+        return ()
+
+    root_names = tuple(sorted(catalog.root))
+    for revoke_count in range(1, len(root_names) + 1):
+        for revoked in itertools.combinations(root_names, revoke_count):
+            retained = {
+                name: catalog.root[name] for name in root_names if name not in revoked
+            }
+            candidate_catalog = replace(catalog, root=retained)
+            selection = brute_force_catalog(candidate_catalog)
+            if selection is not None:
+                return revoked, selection
+    return None
+
+
 def solve_payload(payload):
     catalog = parse_request(payload)
     result = solve(catalog)
     return None if result is None else dict(sorted(result.items()))
+
+
+def relax_payload(payload):
+    catalog = parse_request(payload)
+    result = solve_relaxed_roots(catalog)
+    return result.revoked_roots, dict(sorted(result.selection.items()))
+
+
+def expected_changes(catalog, selection):
+    changes = []
+    for name in catalog.ordered_names:
+        before = catalog.installed.get(name)
+        after = selection.get(name)
+        if before == after:
+            continue
+        if before is None:
+            action = "added"
+        elif after is None:
+            action = "removed"
+        else:
+            action = "changed"
+        changes.append(PackageChange(name, action, before, after))
+    return tuple(changes)
 
 
 def payload_from_generated(packages, root, installed, conflicts=None):
@@ -178,6 +224,39 @@ def test_medium_random_catalogs_with_conflicts_match_full_enumeration(seed):
     expected = brute_force(payload)
     actual = solve_payload(payload)
     assert actual == (None if expected is None else dict(sorted(expected.items())))
+
+
+@pytest.mark.parametrize("seed", range(100))
+def test_relaxed_roots_match_full_enumeration(seed):
+    payload = make_random_payload(
+        seed + 4000, package_count=3, max_versions=3, conflict_count=4
+    )
+    catalog = parse_request(payload)
+    expected_selection = brute_force_catalog(catalog)
+    result = solve_relaxed_roots(catalog)
+
+    if expected_selection is not None:
+        assert result.revoked_roots == ()
+        assert result.selection == expected_selection
+    else:
+        expected_relaxation = brute_force_relaxed(payload)
+        assert expected_relaxation is not None
+        expected_revoked, expected_retained_selection = expected_relaxation
+        assert result.revoked_roots == expected_revoked
+        assert dict(sorted(result.selection.items())) == dict(
+            sorted(expected_retained_selection.items())
+        )
+        assert result.changes == expected_changes(catalog, result.selection)
+
+        # Re-add each revoked root to independently verify the concession.
+        for name in result.revoked_roots:
+            roots = {
+                kept: catalog.root[kept]
+                for kept in catalog.root
+                if kept not in result.revoked_roots
+            }
+            roots[name] = catalog.root[name]
+            assert solve(replace(catalog, root=roots)) is None
 
 
 def test_simple_root_selects_highest_compatible_version():
@@ -469,3 +548,179 @@ def test_empty_conflicts_list_behaves_like_omitted_conflicts():
     }
     with_empty = dict(base, conflicts=[])
     assert solve_payload(with_empty) == solve_payload(base) == {"a": 1, "b": 2}
+
+
+def test_relaxed_roots_withdraws_only_whole_conflicting_root():
+    payload = {
+        "packages": {
+            "a": {"1": {}},
+            "b": {"1": {}},
+            "c": {"1": {}},
+        },
+        "root": {"a": [1, 1], "b": [1, 1], "c": [1, 1]},
+        "installed": {"a": 1, "c": 9},
+        "conflicts": [[["a", 1], ["b", 1]], [["a", 1], ["c", 1]]],
+    }
+    result = solve_relaxed_roots(parse_request(payload))
+    assert result.revoked_roots == ("a",)
+    assert result.selection == {"b": 1, "c": 1}
+    assert result.changes == (
+        PackageChange("a", "removed", 1, None),
+        PackageChange("b", "added", None, 1),
+        PackageChange("c", "changed", 9, 1),
+    )
+
+
+def test_relaxed_roots_tie_is_decided_by_revoked_name_vector():
+    # Revoking either root makes the remainder installable.  Concession-set
+    # ordering selects a before comparing the two retained plans.
+    payload = {
+        "packages": {"a": {"1": {}, "2": {}}, "b": {"1": {}}},
+        "root": {"a": [2, 2], "b": [1, 1]},
+        "installed": {},
+        "conflicts": [[["a", 2], ["b", 1]]],
+    }
+    assert relax_payload(payload) == (("a",), {"b": 1})
+
+
+def test_relaxed_roots_tie_at_two_revocations():
+    payload = {
+        "packages": {
+            "a": {"1": {}},
+            "b": {"1": {}},
+            "c": {"1": {}},
+        },
+        "root": {"a": [1, 1], "b": [1, 1], "c": [1, 1]},
+        "installed": {},
+        "conflicts": [
+            [["a", 1], ["b", 1]],
+            [["a", 1], ["c", 1]],
+            [["b", 1], ["c", 1]],
+        ],
+    }
+    assert relax_payload(payload) == (("a", "b"), {"c": 1})
+
+
+def test_relaxed_search_does_not_reuse_a_failed_candidates_state():
+    # Lexicographically, revoking a is tried first but leaves conflicting b/c.
+    # Revoking b must then start from fresh propagated root state and retain a/c.
+    payload = {
+        "packages": {"a": {"1": {}}, "b": {"1": {}}, "c": {"1": {}}},
+        "root": {"a": [1, 1], "b": [1, 1], "c": [1, 1]},
+        "installed": {},
+        "conflicts": [[["a", 1], ["b", 1]], [["b", 1], ["c", 1]]],
+    }
+    assert relax_payload(payload) == (("b",), {"a": 1, "c": 1})
+
+
+def test_relaxed_full_enumeration_covers_cycle_conflict_and_stale_install():
+    payload = {
+        "packages": {
+            "a": {
+                "1": {"dependencies": {"b": [1, 1]}},
+                "2": {"dependencies": {"b": [2, 2]}},
+            },
+            "b": {
+                "1": {"dependencies": {"a": [1, 1]}},
+                "2": {"dependencies": {"a": [2, 2]}},
+            },
+            "c": {"1": {}},
+        },
+        "root": {"a": [1, 2], "c": [2, 2]},
+        "installed": {"a": 9, "b": 9},
+        "conflicts": [[["a", 2], ["b", 2]]],
+    }
+    catalog = parse_request(payload)
+    assert brute_force_catalog(catalog) is None
+    assert brute_force_relaxed(payload) == (("c",), {"a": 1, "b": 1})
+
+    result = solve_relaxed_roots(catalog)
+    assert result.revoked_roots == ("c",)
+    assert result.selection == {"a": 1, "b": 1}
+    assert result.changes == (
+        PackageChange("a", "changed", 9, 1),
+        PackageChange("b", "changed", 9, 1),
+    )
+    assert solve(replace(catalog, root={"a": [1, 2], "c": [2, 2]})) is None
+
+
+def test_relaxed_retained_plan_uses_maximal_version_vector():
+    payload = {
+        "packages": {
+            "a": {
+                "1": {"dependencies": {"b": [1, 2]}},
+                "2": {"dependencies": {"b": [1, 2]}},
+            },
+            "b": {"1": {}, "2": {}},
+            "c": {"1": {}},
+        },
+        "root": {"a": [1, 2], "b": [1, 2], "c": [2, 2]},
+        "installed": {},
+    }
+    catalog = parse_request(payload)
+    assert brute_force_relaxed(payload) == (("c",), {"a": 2, "b": 2})
+    assert relax_payload(payload) == (("c",), {"a": 2, "b": 2})
+
+
+def test_relaxed_roots_then_applies_change_count_package_count_and_vector():
+    payload = {
+        "packages": {
+            "a": {
+                "1": {"dependencies": {"x": [1, 1], "y": [1, 1]}},
+                "2": {"dependencies": {"b": [1, 1]}},
+            },
+            "b": {"1": {}},
+            "x": {"1": {}},
+            "y": {"1": {}},
+            "c": {"1": {}},
+        },
+        "root": {"a": [1, 2], "c": [2, 2]},
+        "installed": {"a": 9},
+    }
+    result = solve_relaxed_roots(parse_request(payload))
+    assert result.revoked_roots == ("c",)
+    assert result.selection == {"a": 2, "b": 1}
+    assert result.changes == (
+        PackageChange("a", "changed", 9, 2),
+        PackageChange("b", "added", None, 1),
+    )
+
+
+def test_relaxed_roots_solves_retained_dependency_cycle():
+    payload = {
+        "packages": {
+            "a": {"1": {"dependencies": {"b": [1, 2]}}},
+            "b": {
+                "1": {"dependencies": {"a": [1, 1]}},
+                "2": {},
+            },
+            "c": {"1": {}},
+        },
+        "root": {"a": [1, 1], "c": [2, 2]},
+        "installed": {},
+    }
+    assert relax_payload(payload) == (("c",), {"a": 1, "b": 2})
+
+
+def test_relaxing_all_roots_returns_empty_closure_and_records_removals():
+    payload = {
+        "packages": {"a": {"1": {}}},
+        "root": {"a": [2, 2]},
+        "installed": {"a": 1},
+    }
+    result = solve_relaxed_roots(parse_request(payload))
+    assert result.revoked_roots == ("a",)
+    assert result.selection == {}
+    assert result.changes == (PackageChange("a", "removed", 1, None),)
+
+
+def test_relaxed_roots_returns_unchanged_plan_when_original_is_solvable():
+    payload = {
+        "packages": {"a": {"1": {}, "2": {}}},
+        "root": {"a": [1, 2]},
+        "installed": {"a": 2},
+    }
+    result = solve_relaxed_roots(parse_request(payload))
+    assert result.revoked_requirements == {}
+    assert result.selection == {"a": 2}
+    assert result.changes == ()

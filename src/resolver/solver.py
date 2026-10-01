@@ -3,11 +3,36 @@
 from __future__ import annotations
 
 from bisect import bisect_right
+from dataclasses import dataclass, replace
+from itertools import combinations
 from typing import Optional
 
 from .model import Catalog
 
 Selection = dict[str, int]
+
+
+@dataclass(frozen=True)
+class PackageChange:
+    """One package-level difference between ``installed`` and a selection."""
+
+    name: str
+    action: str  # "added", "removed", or "changed"
+    before: Optional[int]
+    after: Optional[int]
+
+
+@dataclass(frozen=True)
+class RootRelaxation:
+    """A complete plan found by temporarily withdrawing root requirements."""
+
+    revoked_requirements: dict[str, tuple[int, int]]
+    selection: Selection
+    changes: tuple[PackageChange, ...]
+
+    @property
+    def revoked_roots(self) -> tuple[str, ...]:
+        return tuple(sorted(self.revoked_requirements))
 
 
 def solve(catalog: Catalog) -> Optional[Selection]:
@@ -201,3 +226,84 @@ def solve(catalog: Catalog) -> Optional[Selection]:
 
     dfs()
     return best
+
+
+def package_changes(
+    catalog: Catalog, selection: Selection
+) -> tuple[PackageChange, ...]:
+    """Return package-level changes relative to ``catalog.installed``."""
+    changes: list[PackageChange] = []
+    for name in catalog.ordered_names:
+        before = catalog.installed.get(name)
+        after = selection.get(name)
+        if before == after:
+            continue
+        if before is None:
+            action = "added"
+        elif after is None:
+            action = "removed"
+        else:
+            action = "changed"
+        changes.append(
+            PackageChange(name=name, action=action, before=before, after=after)
+        )
+    return tuple(changes)
+
+
+def solve_relaxed_roots(catalog: Catalog) -> RootRelaxation:
+    """Solve after withdrawing the minimum set of complete root requirements.
+
+    The original request is solved first without any concession.  If it has no
+    solution, root subsets are searched independently.  Each attempt gets a new
+    catalog and therefore starts with fresh propagated bounds/backtracking
+    state; dependencies, conflicts, versions, and installed packages are never
+    rewritten.
+
+    Subsets are ordered first by cardinality and then by their lexicographically
+    sorted package names.  The retained roots use the normal solver objective.
+    Every withdrawn root is finally re-added separately as a minimality check.
+    """
+    full_selection = solve(catalog)
+    if full_selection is not None:
+        return RootRelaxation(
+            revoked_requirements={},
+            selection=full_selection,
+            changes=package_changes(catalog, full_selection),
+        )
+
+    root_names = tuple(sorted(catalog.root))
+    for revoke_count in range(1, len(root_names) + 1):
+        # itertools.combinations over sorted names emits equal-sized tuples in
+        # lexicographic order, implementing the concession tie-breaker.
+        for revoked_names in combinations(root_names, revoke_count):
+            revoked_set = set(revoked_names)
+            retained_roots = {
+                name: catalog.root[name]
+                for name in root_names
+                if name not in revoked_set
+            }
+            relaxed_catalog = replace(catalog, root=retained_roots)
+            selection = solve(relaxed_catalog)
+            if selection is None:
+                continue
+
+            for name in revoked_names:
+                check_roots = dict(retained_roots)
+                check_roots[name] = catalog.root[name]
+                if solve(replace(catalog, root=check_roots)) is not None:
+                    # This would mean the concession was not part of a minimum
+                    # unresolvable set and indicates a solver bug, not an input
+                    # problem.  Never silently emit a partial or invalid plan.
+                    raise RuntimeError(
+                        f"root requirement {name!r} was unnecessarily revoked"
+                    )
+
+            revoked_requirements = {name: catalog.root[name] for name in revoked_names}
+            return RootRelaxation(
+                revoked_requirements=revoked_requirements,
+                selection=selection,
+                changes=package_changes(catalog, selection),
+            )
+
+    # Withdrawing every root always yields the empty closure.
+    raise RuntimeError("root relaxation unexpectedly found no installable plan")
