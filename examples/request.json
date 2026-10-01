@@ -1,0 +1,25 @@
+{
+  "packages": {
+    "app": {
+      "1": {"dependencies": {"lib": [1, 1]}},
+      "2": {"dependencies": {"lib": [2, 3]}}
+    },
+    "lib": {
+      "1": {"dependencies": {"common": [1, 2]}},
+      "2": {"dependencies": {"common": [2, 2]}},
+      "3": {"dependencies": {"common": [2, 2]}}
+    },
+    "common": {
+      "1": {"dependencies": {}},
+      "2": {"dependencies": {}}
+    }
+  },
+  "root": {
+    "app": [1, 2]
+  },
+  "installed": {
+    "app": 1,
+    "lib": 1,
+    "common": 1
+  }
+}

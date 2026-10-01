@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "offline-resolver"
+version = "1.0.0"
+description = "Exact offline package dependency resolver"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+offline-resolver = "resolver.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+pythonpath = ["src"]

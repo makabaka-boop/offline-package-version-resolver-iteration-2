@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.git/
+tests/
+examples/
+*.md
+docker-compose.yml

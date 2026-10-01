@@ -1,0 +1,19 @@
+services:
+  resolver:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: offline-resolver:latest
+    stdin_open: true
+    tty: false
+
+  test:
+    image: python:3.11-slim
+    working_dir: /workspace
+    environment:
+      PYTHONPATH: /workspace/src
+    command: >
+      sh -c "pip install --no-cache-dir -r requirements-dev.txt &&
+             python -m pytest -q"
+    volumes:
+      - ./:/workspace
