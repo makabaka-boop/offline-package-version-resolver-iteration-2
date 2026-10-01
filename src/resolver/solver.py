@@ -3,11 +3,62 @@
 from __future__ import annotations
 
 from bisect import bisect_right
+from dataclasses import dataclass
+from itertools import combinations
 from typing import Optional
 
 from .model import Catalog
 
 Selection = dict[str, int]
+
+
+@dataclass(frozen=True)
+class Change:
+    """A single installed package's difference from ``installed``.
+
+    ``kind`` is ``"added"`` (absent before, present after), ``"removed"``
+    (present before, absent after) or ``"changed"`` (present at both times but
+    a different version).
+    """
+
+    name: str
+    old: Optional[int]
+    new: Optional[int]
+    kind: str
+
+
+@dataclass(frozen=True)
+class RelaxedPlan:
+    """Result of root-requirement relaxation.
+
+    ``revoked`` names the whole root requirements temporarily dropped; the
+    retained requirements are solved with the ordinary objectives.  Nothing in
+    dependencies, conflicts or installed versions is ever rewritten.
+    """
+
+    revoked: tuple[str, ...]
+    selection: Selection
+    changes: tuple[Change, ...]
+
+
+def compute_changes(
+    selection: Selection, installed: dict[str, int]
+) -> tuple[Change, ...]:
+    """Describe every package that differs from the installed state."""
+    changes: list[Change] = []
+    for name in sorted(set(selection) | set(installed)):
+        old = installed.get(name)
+        new = selection.get(name)
+        if old == new:
+            continue
+        if old is None:
+            kind = "added"
+        elif new is None:
+            kind = "removed"
+        else:
+            kind = "changed"
+        changes.append(Change(name=name, old=old, new=new, kind=kind))
+    return tuple(changes)
 
 
 def solve(catalog: Catalog) -> Optional[Selection]:
@@ -17,6 +68,57 @@ def solve(catalog: Catalog) -> Optional[Selection]:
     dependency interval contains the selected dependency, no declared conflict
     pair is installed together, and no package outside that reachable closure
     is present.
+    """
+    return _solve(catalog, catalog.root)
+
+
+def solve_relaxed(catalog: Catalog) -> Optional[RelaxedPlan]:
+    """Relax an infeasible request by temporarily revoking whole roots only.
+
+    Candidate revocation sets are examined in order of:
+
+    1. fewest revoked root requirements, then
+    2. lexicographically smallest list of revoked package names.
+
+    For the first (hence best under that order) set whose retained roots admit
+    a complete closure, the ordinary solver returns that closure under the
+    unchanged objectives (fewest changes, then fewest packages, then the
+    lexicographically largest version vector).
+
+    Each candidate is solved from a fresh propagation state, so constraint
+    propagation and branching never leak between root sets.  Revoking every
+    root always admits the empty closure, so the only ``None`` result would be
+    a malformed catalog, which validation rejects before solving.
+    """
+    root_names = sorted(catalog.root)
+    for size in range(len(root_names) + 1):
+        # ``combinations`` yields tuples in lexicographic order when its input
+        # iterable is sorted, so the first feasible set already wins the
+        # tie-break without comparing closures across distinct revocations.
+        for revoked in combinations(root_names, size):
+            revoked_set = set(revoked)
+            retained = {
+                name: catalog.root[name]
+                for name in root_names
+                if name not in revoked_set
+            }
+            selection = _solve(catalog, retained)
+            if selection is not None:
+                return RelaxedPlan(
+                    revoked=tuple(revoked),
+                    selection=selection,
+                    changes=compute_changes(selection, catalog.installed),
+                )
+    return None
+
+
+def _solve(
+    catalog: Catalog, roots: dict[str, tuple[int, int]]
+) -> Optional[Selection]:
+    """Solve for a specific set of retained root requirements.
+
+    All mutable search state is created locally for this call, which keeps
+    searches over different retained-root sets fully isolated.
     """
     names = catalog.ordered_names
     versions = {name: catalog.versions[name] for name in names}
@@ -30,7 +132,7 @@ def solve(catalog: Catalog) -> Optional[Selection]:
         conflict_partners.setdefault((name_b, version_b), set()).add((name_a, version_a))
 
     # name -> closed (lower, upper) bounds accumulated from roots/edges
-    bounds: dict[str, tuple[int, int]] = dict(catalog.root)
+    bounds: dict[str, tuple[int, int]] = dict(roots)
     selected: Selection = {}
     best: Optional[Selection] = None
     best_change = 1 << 30
